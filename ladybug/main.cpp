@@ -8,157 +8,194 @@
 #include <DHT.h> 
 #include <ESP32Servo.h> 
 
-// --- Load Our Custom Pin Configuration ---
+// --- Networking & API Libraries ---
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h> // Left included for future Supabase DB integration
+
+// --- Custom Includes ---
 #include "PinConfig.h" 
+#include "WebDashboard.h" 
+
+// ==========================================
+// CONFIGURATION: WIFI 
+// ==========================================
+const char* ssid = "Nooruddin";       
+const char* password = "IRONMAIDEN"; 
+
+WebServer server(80); 
+String localIP = "Not Connected";
 
 LilyGo_Class amoled;
-
-// ==========================================
-// HARDWARE OBJECTS
-// ==========================================
 Servo servoWater;
 
 #define DHTTYPE DHT22
 DHT dht(DHT_PIN, DHTTYPE);
 
 // ==========================================
-// WINGS (SERVO) LOGIC
+// SYSTEM STATE VARIABLES
 // ==========================================
+unsigned long systemStartTime = 0;
+unsigned long lastWateredTime = 0; 
+unsigned long streakStartTime = 0;
+bool isStreakActive = false;
+int currentStreakHours = 0;
+
 bool autoWingsEnabled = true;        
 const int SOIL_THRESHOLD = 30;      
-const unsigned long WINGS_TIME = 3000; 
+const unsigned long WINGS_TIME = 4000; 
 
 bool isFlapping = false;
 unsigned long flappingStartTime = 0;
-
 unsigned long lastSweepUpdate = 0;
 int currentServoAngle = 0;
-int servoSweepDirection = 5; 
+int servoSweepDirection = 1; 
+
+enum FlapMode { FLAP_NORMAL, FLAP_WATER_ALARM, FLAP_TEMP_ALARM };
+FlapMode currentFlapMode = FLAP_NORMAL;
+
+unsigned long lastSoilAlarmTime = 0;
+unsigned long lastTempAlarmTime = 0;
+const unsigned long ALARM_COOLDOWN = 1200000; 
+unsigned long pauseUntil = 0; 
+
+unsigned long lastSensorUpdate = 0;
+
+int current_soil = 0;
+float current_temp = 0.0;
+float current_hum = 0.0;
 
 // ==========================================
-// GLOBAL UI POINTERS & SENSOR STATE
+// GLOBAL UI POINTERS
 // ==========================================
 lv_obj_t * main_screen;
 lv_obj_t * settings_overlay;
-
-// Ladybug Parts
 lv_obj_t * bug_body;
 lv_obj_t * bug_head;
 lv_obj_t * spots[7];
 lv_anim_t breath_anim;
-
-// Ladybug Eyes
 lv_obj_t * left_eye;
 lv_obj_t * right_eye;
 lv_obj_t * left_pupil;
 lv_obj_t * right_pupil;
-
-// Dashboard Interactive Elements
 lv_obj_t * btn_wings;
 lv_obj_t * lbl_soil_val;
 lv_obj_t * lbl_temp_val;
 lv_obj_t * lbl_hum_val;
-
-// Popup Menu Elements
 lv_obj_t * info_popup;
 lv_obj_t * popup_title;
 lv_obj_t * popup_icon;
 lv_obj_t * popup_value;
 lv_obj_t * popup_desc;
 
-// Live Sensor Data Storage
-int current_soil = 0;
-float current_temp = 0.0;
-float current_hum = 0.0;
-unsigned long lastSensorUpdate = 0;
-
 // ==========================================
 // SERVO FUNCTIONS
 // ==========================================
-void startFlapping() {
-    Serial.println("🦋 WINGS INITIATED! Starting sweep.");
+void startFlapping(FlapMode mode = FLAP_NORMAL) {
+    Serial.println("🦋 WINGS INITIATED!");
     isFlapping = true;
     flappingStartTime = millis();
+    currentFlapMode = mode;
     currentServoAngle = 0;
-    servoSweepDirection = 5; 
+    servoSweepDirection = 1; 
+    pauseUntil = 0;
     lv_obj_set_style_bg_color(btn_wings, lv_color_hex(0x551199), 0); 
+    
+    // --- TIMELINE UPDATE: Log watering event ---
+    if (mode == FLAP_WATER_ALARM) {
+        lastWateredTime = millis();
+    }
 }
 
 void stopFlapping() {
     Serial.println("🛑 WINGS COMPLETE. Servo parked.");
     servoWater.write(0); 
     isFlapping = false;
+    currentFlapMode = FLAP_NORMAL;
     lv_obj_set_style_bg_color(btn_wings, lv_color_hex(0x9933FF), 0); 
 }
 
 // ==========================================
-// MAIN DASHBOARD BUTTON CALLBACKS
+// WEB SERVER HANDLERS
 // ==========================================
-void manual_wings_cb(lv_event_t * e) {
-    if (!isFlapping) { startFlapping(); }
+void handleRoot() {
+    server.send(200, "text/html", getDashboardHTML(current_soil, current_temp, current_hum));
 }
 
-void close_popup_cb(lv_event_t * e) {
-    lv_obj_add_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
+void handleApiData() {
+    unsigned long currentMillis = millis();
+    
+    // Calculate timeline data in minutes/hours for the frontend
+    long uptime_mins = (currentMillis - systemStartTime) / 60000;
+    long last_watered_mins = (lastWateredTime == 0) ? -1 : (currentMillis - lastWateredTime) / 60000;
+
+    String json = "{";
+    json += "\"soil_moisture\":" + String(current_soil) + ",";
+    json += "\"temperature\":" + String(current_temp) + ",";
+    json += "\"humidity\":" + String(current_hum) + ",";
+    json += "\"is_flapping\":" + String(isFlapping ? "true" : "false") + ",";
+    json += "\"uptime_mins\":" + String(uptime_mins) + ",";
+    json += "\"last_watered_mins\":" + String(last_watered_mins) + ",";
+    json += "\"streak_hours\":" + String(currentStreakHours);
+    json += "}";
+    
+    server.send(200, "application/json", json);
 }
+
+void handleFlap() {
+    if (!isFlapping) { 
+        if (server.hasArg("mode")) {
+            String mode = server.arg("mode");
+            if (mode == "water") {
+                startFlapping(FLAP_WATER_ALARM);
+            } else if (mode == "temp") {
+                startFlapping(FLAP_TEMP_ALARM);
+            } else {
+                startFlapping(FLAP_NORMAL);
+            }
+        } else {
+            startFlapping(FLAP_NORMAL); 
+        }
+    }
+    server.send(200, "text/plain", "Wings flapping initiated!");
+}
+
+// ==========================================
+// LVGL DASHBOARD CALLBACKS 
+// ==========================================
+void manual_wings_cb(lv_event_t * e) { if (!isFlapping) { startFlapping(FLAP_NORMAL); } }
+void close_popup_cb(lv_event_t * e) { lv_obj_add_flag(info_popup, LV_OBJ_FLAG_HIDDEN); }
 
 void soil_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "SOIL MOISTURE");
     lv_label_set_text(popup_icon, LV_SYMBOL_TINT);
     lv_obj_set_style_text_color(popup_icon, lv_color_hex(0x0088FF), 0);
-    
-    char buf[32];
-    sprintf(buf, "%d %%", current_soil);
-    lv_label_set_text(popup_value, buf);
-    
+    char buf[32]; sprintf(buf, "%d %%", current_soil); lv_label_set_text(popup_value, buf);
     lv_label_set_text(popup_desc, "Basil loves moist, well-drained soil.\nKeep it between 40% and 60%.\nNever let it completely dry out!");
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup); 
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup); 
 }
 
 void temp_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "TEMPERATURE");
     lv_label_set_text(popup_icon, LV_SYMBOL_HOME);
     lv_obj_set_style_text_color(popup_icon, lv_color_hex(0xFF4444), 0);
-    
-    char buf[32];
-    sprintf(buf, "%.1f C", current_temp);
-    lv_label_set_text(popup_value, buf);
-    
+    char buf[32]; sprintf(buf, "%.1f C", current_temp); lv_label_set_text(popup_value, buf);
     lv_label_set_text(popup_desc, "Basil thrives in a warm climate\nbetween 20 C and 25 C.\nCold drafts will blacken the leaves.");
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup);
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup);
 }
 
 void hum_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "AIR HUMIDITY");
     lv_label_set_text(popup_icon, LV_SYMBOL_REFRESH);
     lv_obj_set_style_text_color(popup_icon, lv_color_hex(0x22CC44), 0);
-    
-    char buf[32];
-    sprintf(buf, "%.0f %%", current_hum);
-    lv_label_set_text(popup_value, buf);
-    
+    char buf[32]; sprintf(buf, "%.0f %%", current_hum); lv_label_set_text(popup_value, buf);
     lv_label_set_text(popup_desc, "Ideal humidity is 40% to 60%.\nToo high risks mold and rot,\ntoo low crisping leaves.");
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup);
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup);
 }
 
-void open_settings_cb(lv_event_t * e) {
-    lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
-}
-
-void close_settings_cb(lv_event_t * e) {
-    lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
-}
-
-void breath_anim_cb(void * var, int32_t v) {
-    lv_obj_set_style_translate_y((lv_obj_t *)var, v, 0);
-}
-
-// ==========================================
-// SETTINGS MENU CALLBACKS
-// ==========================================
+void open_settings_cb(lv_event_t * e) { lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN); }
+void close_settings_cb(lv_event_t * e) { lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN); }
+void breath_anim_cb(void * var, int32_t v) { lv_obj_set_style_translate_y((lv_obj_t *)var, v, 0); }
 
 void lib_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "PLANT LIBRARY");
@@ -166,8 +203,7 @@ void lib_click_cb(lv_event_t * e) {
     lv_obj_set_style_text_color(popup_icon, lv_color_hex(0x22CC44), 0);
     lv_label_set_text(popup_value, "BASIL SELECTED");
     lv_label_set_text(popup_desc, "Connect to the mobile app\nto upload new plant profiles\nand custom thresholds.");
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup);
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup);
 }
 
 void toggle_wings_cb(lv_event_t * e) {
@@ -181,63 +217,58 @@ void toggle_wings_cb(lv_event_t * e) {
 void wifi_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "WIFI SETTINGS");
     lv_label_set_text(popup_icon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_color(popup_icon, lv_color_hex(0xFFAA00), 0);
-    lv_label_set_text(popup_value, "DISCONNECTED");
-    lv_label_set_text(popup_desc, "Device is in offline mode.\nBluetooth provisioning\ncoming in next update.");
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup);
+    if (WiFi.status() == WL_CONNECTED) {
+        lv_obj_set_style_text_color(popup_icon, lv_color_hex(0x22CC44), 0); 
+        lv_label_set_text(popup_value, localIP.c_str());
+        lv_label_set_text(popup_desc, "Connected to Hotspot.\nType this IP into your\nphone's browser to view.");
+    } else {
+        lv_obj_set_style_text_color(popup_icon, lv_color_hex(0xFF4444), 0); 
+        lv_label_set_text(popup_value, "DISCONNECTED");
+        lv_label_set_text(popup_desc, "Device could not find\nthe hotspot. Running in\noffline mode.");
+    }
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup);
 }
 
 void toggle_sleep_cb(lv_event_t * e) {
     lv_obj_t * btn = lv_event_get_target(e);
     bool is_checked = lv_obj_has_state(btn, LV_STATE_CHECKED);
-    if(is_checked) { 
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x22CC44), 0); 
-        amoled.setBrightness(20); // Dim screen significantly
-    } else { 
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x333333), 0); 
-        amoled.setBrightness(180); // Restore brightness
-    }
+    if(is_checked) { lv_obj_set_style_bg_color(btn, lv_color_hex(0x22CC44), 0); amoled.setBrightness(20); } 
+    else { lv_obj_set_style_bg_color(btn, lv_color_hex(0x333333), 0); amoled.setBrightness(180); }
 }
 
 void data_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "CALIBRATION DATA");
     lv_label_set_text(popup_icon, LV_SYMBOL_SETTINGS);
     lv_obj_set_style_text_color(popup_icon, lv_color_hex(0xFFFFFF), 0);
-    
     int raw = analogRead(SOIL_PIN);
-    char buf[64];
-    sprintf(buf, "Raw Soil Input: %d\nDry Limit: %d\nWet Limit: %d", raw, SOIL_DRY_VAL, SOIL_WET_VAL);
-    
+    char buf[64]; sprintf(buf, "Raw Soil Input: %d\nDry Limit: %d\nWet Limit: %d", raw, SOIL_DRY_VAL, SOIL_WET_VAL);
     lv_label_set_text(popup_value, "SENSOR DEBUG");
     lv_label_set_text(popup_desc, buf);
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup);
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup);
 }
 
 void system_click_cb(lv_event_t * e) {
     lv_label_set_text(popup_title, "SYSTEM INFO");
     lv_label_set_text(popup_icon, LV_SYMBOL_SETTINGS);
     lv_obj_set_style_text_color(popup_icon, lv_color_hex(0x0088FF), 0);
-    lv_label_set_text(popup_value, "HEXULE OS v1.0");
-    lv_label_set_text(popup_desc, "Hardware: LilyGO T4 S3\nDirect Sensor Polling Active\nAll systems operational.");
-    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(info_popup);
+    lv_label_set_text(popup_value, "Florette OS v2.1");
+    lv_label_set_text(popup_desc, "Hardware: LilyGO T4 S3\nWeb Dashboard Active\nAll systems operational.");
+    lv_obj_clear_flag(info_popup, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(info_popup);
 }
-
 
 void setup() {
   Serial.begin(115200);
   delay(1000); 
 
-  // --- 1. INITIALIZE AMOLED & TOUCH ---
+  // Capture the start time for the timeline
+  systemStartTime = millis();
+
   if (!amoled.begin()) {
     while (1) { Serial.println("❌ ERROR: Display failed!"); delay(1000); }
   }
   amoled.setBrightness(180); 
   beginLvglHelper(amoled);
 
-  // --- 2. INITIALIZE SENSORS & SERVO ---
   dht.begin();
   pinMode(SOIL_PIN, INPUT);
 
@@ -249,6 +280,33 @@ void setup() {
   servoWater.setPeriodHertz(50); 
   servoWater.attach(SERVO_WATER_PIN, 500, 2400);
   servoWater.write(0);
+
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+      lv_timer_handler();
+      delay(500);
+      Serial.print(".");
+      retries++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+      localIP = WiFi.localIP().toString();
+      Serial.println("\n✅ WiFi Connected!");
+      Serial.print("IP Address: ");
+      Serial.println(localIP);
+      
+      server.on("/", handleRoot);
+      server.on("/api/data", handleApiData);
+      server.on("/flap", handleFlap);
+      
+      server.begin();
+  } else {
+      Serial.println("\n⚠️ WiFi Connection Failed. Continuing offline.");
+  }
 
   main_screen = lv_scr_act();
   lv_obj_set_style_bg_color(main_screen, lv_color_hex(0x000000), 0);
@@ -335,88 +393,72 @@ void setup() {
   lv_anim_start(&breath_anim);
 
   lv_obj_t * plant_name = lv_label_create(main_screen);
-  lv_label_set_text(plant_name, "BASIL BERRY");
+  lv_label_set_text(plant_name, "FLORETTE");
   lv_obj_set_style_text_font(plant_name, &lv_font_montserrat_24, 0); 
   lv_obj_set_style_text_color(plant_name, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(plant_name, LV_ALIGN_BOTTOM_MID, 0, -20);
 
   /* =========================================
-   * BIG DASHBOARD BUTTONS (CIRCLES SCALED TO 150)
+   * BIG DASHBOARD BUTTONS 
    * ========================================= */
-
-  // 1. TOP LEFT: WINGS
   btn_wings = lv_btn_create(main_screen);
   lv_obj_set_size(btn_wings, 150, 150);
   lv_obj_align(btn_wings, LV_ALIGN_TOP_LEFT, 20, 20); 
   lv_obj_set_style_radius(btn_wings, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(btn_wings, lv_color_hex(0x9933FF), 0); 
   lv_obj_add_event_cb(btn_wings, manual_wings_cb, LV_EVENT_CLICKED, NULL);
-
   lv_obj_t * lbl_wings_icon = lv_label_create(btn_wings);
   lv_label_set_text(lbl_wings_icon, LV_SYMBOL_UP); 
   lv_obj_align(lbl_wings_icon, LV_ALIGN_TOP_MID, 0, 20);
-
   lv_obj_t * lbl_wings_text = lv_label_create(btn_wings);
   lv_obj_set_style_text_font(lbl_wings_text, &lv_font_montserrat_24, 0); 
   lv_label_set_text(lbl_wings_text, "WINGS");
   lv_obj_align(lbl_wings_text, LV_ALIGN_BOTTOM_MID, 0, -25);
 
-
-  // 2. TOP RIGHT: SOIL MOISTURE
   lv_obj_t * btn_soil = lv_btn_create(main_screen);
   lv_obj_set_size(btn_soil, 150, 150);
   lv_obj_align(btn_soil, LV_ALIGN_TOP_RIGHT, -20, 20); 
   lv_obj_set_style_radius(btn_soil, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(btn_soil, lv_color_hex(0x0088FF), 0); 
   lv_obj_add_event_cb(btn_soil, soil_click_cb, LV_EVENT_CLICKED, NULL); 
-  
   lv_obj_t * lbl_soil_icon = lv_label_create(btn_soil);
   lv_label_set_text(lbl_soil_icon, LV_SYMBOL_TINT); 
   lv_obj_align(lbl_soil_icon, LV_ALIGN_TOP_MID, 0, 20);
-
   lbl_soil_val = lv_label_create(btn_soil);
   lv_obj_set_style_text_font(lbl_soil_val, &lv_font_montserrat_24, 0);
   lv_label_set_text(lbl_soil_val, "--"); 
   lv_obj_align(lbl_soil_val, LV_ALIGN_BOTTOM_MID, 0, -25);
 
-
-  // 3. BOTTOM LEFT: TEMPERATURE
   lv_obj_t * btn_temp = lv_btn_create(main_screen);
   lv_obj_set_size(btn_temp, 150, 150);
   lv_obj_align(btn_temp, LV_ALIGN_BOTTOM_LEFT, 20, -20); 
   lv_obj_set_style_radius(btn_temp, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(btn_temp, lv_color_hex(0xFF4444), 0); 
   lv_obj_add_event_cb(btn_temp, temp_click_cb, LV_EVENT_CLICKED, NULL); 
-  
   lv_obj_t * lbl_temp_icon = lv_label_create(btn_temp);
   lv_label_set_text(lbl_temp_icon, LV_SYMBOL_HOME);
   lv_obj_align(lbl_temp_icon, LV_ALIGN_TOP_MID, 0, 20);
-
   lbl_temp_val = lv_label_create(btn_temp);
   lv_obj_set_style_text_font(lbl_temp_val, &lv_font_montserrat_24, 0);
   lv_label_set_text(lbl_temp_val, "--");
   lv_obj_align(lbl_temp_val, LV_ALIGN_BOTTOM_MID, 0, -25);
 
-
-  // 4. BOTTOM RIGHT: HUMIDITY
   lv_obj_t * btn_hum = lv_btn_create(main_screen);
   lv_obj_set_size(btn_hum, 150, 150);
   lv_obj_align(btn_hum, LV_ALIGN_BOTTOM_RIGHT, -20, -20); 
   lv_obj_set_style_radius(btn_hum, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(btn_hum, lv_color_hex(0x22CC44), 0); 
   lv_obj_add_event_cb(btn_hum, hum_click_cb, LV_EVENT_CLICKED, NULL); 
-  
   lv_obj_t * lbl_hum_icon = lv_label_create(btn_hum);
   lv_label_set_text(lbl_hum_icon, LV_SYMBOL_REFRESH); 
   lv_obj_align(lbl_hum_icon, LV_ALIGN_TOP_MID, 0, 20);
-
   lbl_hum_val = lv_label_create(btn_hum);
   lv_obj_set_style_text_font(lbl_hum_val, &lv_font_montserrat_24, 0);
   lv_label_set_text(lbl_hum_val, "--"); 
   lv_obj_align(lbl_hum_val, LV_ALIGN_BOTTOM_MID, 0, -25);
 
   /* =========================================
-   * INFO APP POPUP (NOW WITH LARGE TEXT & SCALED UP)
+   * INFO APP POPUP 
    * ========================================= */
   info_popup = lv_obj_create(main_screen);
   lv_obj_set_size(info_popup, 480, 360); 
@@ -431,16 +473,13 @@ void setup() {
   lv_obj_set_style_text_font(popup_title, &lv_font_montserrat_24, 0); 
   lv_obj_set_style_text_color(popup_title, lv_color_hex(0xAAAAAA), 0);
   lv_obj_align(popup_title, LV_ALIGN_TOP_MID, 0, 15);
-
   popup_icon = lv_label_create(info_popup);
   lv_obj_set_style_text_font(popup_icon, &lv_font_montserrat_24, 0); 
   lv_obj_align(popup_icon, LV_ALIGN_TOP_MID, 0, 60);
-
   popup_value = lv_label_create(info_popup);
   lv_obj_set_style_text_font(popup_value, &lv_font_montserrat_24, 0); 
   lv_obj_set_style_text_color(popup_value, lv_color_hex(0xFFFFFF), 0);
   lv_obj_align(popup_value, LV_ALIGN_TOP_MID, 0, 100);
-
   popup_desc = lv_label_create(info_popup);
   lv_obj_set_style_text_font(popup_desc, &lv_font_montserrat_24, 0); 
   lv_obj_set_width(popup_desc, 440); 
@@ -455,7 +494,6 @@ void setup() {
   lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x333333), 0);
   lv_obj_set_style_radius(close_btn, 25, 0);
   lv_obj_add_event_cb(close_btn, close_popup_cb, LV_EVENT_CLICKED, NULL);
-  
   lv_obj_t * close_lbl = lv_label_create(close_btn);
   lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_24, 0); 
   lv_label_set_text(close_lbl, "CLOSE");
@@ -479,10 +517,8 @@ void setup() {
   lv_obj_set_flex_flow(grid_container, LV_FLEX_FLOW_ROW_WRAP); 
   lv_obj_set_flex_align(grid_container, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-  // Define buttons and callbacks manually instead of a basic loop
   const char* btn_icons[] = {LV_SYMBOL_DIRECTORY, LV_SYMBOL_UP, LV_SYMBOL_WIFI, LV_SYMBOL_POWER, LV_SYMBOL_IMAGE, LV_SYMBOL_SETTINGS};
   const char* btn_texts[] = {"LIBRARY", "AUTO WINGS", "WIFI", "SLEEP", "DATA", "SYSTEM"};
-  
   lv_obj_t * menu_btns[6];
 
   for(int i = 0; i < 6; i++) {
@@ -490,7 +526,6 @@ void setup() {
       lv_obj_set_size(menu_btns[i], 190, 140); 
       lv_obj_set_style_bg_color(menu_btns[i], lv_color_hex(0x333333), 0); 
       lv_obj_set_style_radius(menu_btns[i], 25, 0);
-
       lv_obj_t * menu_lbl = lv_label_create(menu_btns[i]);
       lv_obj_set_style_text_font(menu_lbl, &lv_font_montserrat_24, 0);
       char buf[32];
@@ -500,30 +535,23 @@ void setup() {
       lv_obj_center(menu_lbl);
   }
 
-  // Assign specific functionality to each settings button
   lv_obj_add_event_cb(menu_btns[0], lib_click_cb, LV_EVENT_CLICKED, NULL);
-
   lv_obj_add_flag(menu_btns[1], LV_OBJ_FLAG_CHECKABLE);
   lv_obj_add_state(menu_btns[1], LV_STATE_CHECKED);
   lv_obj_set_style_bg_color(menu_btns[1], lv_color_hex(0x22CC44), 0);
   lv_obj_add_event_cb(menu_btns[1], toggle_wings_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
   lv_obj_add_event_cb(menu_btns[2], wifi_click_cb, LV_EVENT_CLICKED, NULL);
-
   lv_obj_add_flag(menu_btns[3], LV_OBJ_FLAG_CHECKABLE);
   lv_obj_add_event_cb(menu_btns[3], toggle_sleep_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
   lv_obj_add_event_cb(menu_btns[4], data_click_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_add_event_cb(menu_btns[5], system_click_cb, LV_EVENT_CLICKED, NULL);
 
-  // Settings Menu "Back" Button
   lv_obj_t * back_btn = lv_btn_create(settings_overlay);
   lv_obj_set_size(back_btn, 280, 80); 
   lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -30);
   lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xFF1111), 0); 
   lv_obj_set_style_radius(back_btn, 40, 0); 
   lv_obj_add_event_cb(back_btn, close_settings_cb, LV_EVENT_CLICKED, NULL);
-
   lv_obj_t * back_lbl = lv_label_create(back_btn);
   lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_24, 0);
   lv_label_set_text(back_lbl, "BACK TO BUG");
@@ -532,60 +560,107 @@ void setup() {
   Serial.println("✅ Setup complete! UI Scaled and System ready.\n");
 }
 
-
 void loop() {
+  server.handleClient(); 
   lv_timer_handler();
   delay(5); 
 
-  // --- CHECK NON-BLOCKING WINGS SWEEP LOGIC ---
+  // --- NON-BLOCKING WINGS SWEEP & ALARM LOGIC ---
   if (isFlapping) {
       if (millis() - flappingStartTime >= WINGS_TIME) {
           stopFlapping();
       } else {
-          if (millis() - lastSweepUpdate > 30) { 
-              lastSweepUpdate = millis();
-              currentServoAngle += servoSweepDirection;
+          if (millis() >= pauseUntil) { 
+              int currentDelay = (currentFlapMode == FLAP_TEMP_ALARM) ? 5 : 15;
+              int currentStep  = (currentFlapMode == FLAP_TEMP_ALARM) ? 10 : 5;
               
-              if (currentServoAngle >= 90) {
-                  currentServoAngle = 90;
-                  servoSweepDirection = -5; 
-              } else if (currentServoAngle <= 0) {
-                  currentServoAngle = 0;
-                  servoSweepDirection = 5;  
+              if (millis() - lastSweepUpdate > currentDelay) { 
+                  lastSweepUpdate = millis();
+                  currentServoAngle += (currentStep * servoSweepDirection);
+                  
+                  int trueOrigin = 0;  
+                  int maxOpen    = trueOrigin + 70; 
+                  bool hitBoundary = false;
+                  
+                  if (currentServoAngle >= maxOpen) {
+                      currentServoAngle = maxOpen;
+                      servoSweepDirection = -1;
+                      hitBoundary = true;
+                  } else if (currentServoAngle <= trueOrigin) {
+                      currentServoAngle = trueOrigin;
+                      servoSweepDirection = 1;
+                      hitBoundary = true;
+                  }
+                  
+                  servoWater.write(currentServoAngle);
+
+                  if (hitBoundary && currentFlapMode == FLAP_WATER_ALARM) {
+                      pauseUntil = millis() + 500; 
+                  }
               }
-              servoWater.write(currentServoAngle);
           }
       }
   }
 
-  // --- SENSOR POLLING (Every 3 seconds) ---
+  // --- SENSOR POLLING & STREAK EVALUATION (Every 3 seconds) ---
   if (millis() - lastSensorUpdate > 3000) {
       lastSensorUpdate = millis();
       char buf[32]; 
 
-      // 1. Read Soil Moisture 
       int rawSoil = analogRead(SOIL_PIN);
       current_soil = map(rawSoil, SOIL_DRY_VAL, SOIL_WET_VAL, 0, 100); 
       current_soil = constrain(current_soil, 0, 100); 
-      
       sprintf(buf, "%d%%", current_soil);
       lv_label_set_text(lbl_soil_val, buf);
 
-      if (autoWingsEnabled && !isFlapping && current_soil < SOIL_THRESHOLD) {
-          Serial.println("⚠️ Soil is too dry! Auto-wings triggered.");
-          startFlapping();
-      }
-
-      // 2. Read DHT22 Temperature & Humidity 
       current_hum = dht.readHumidity();
       current_temp = dht.readTemperature();
 
       if (!isnan(current_hum) && !isnan(current_temp)) {
           sprintf(buf, "%.1fC", current_temp);
           lv_label_set_text(lbl_temp_val, buf);
-          
           sprintf(buf, "%.0f%%", current_hum); 
           lv_label_set_text(lbl_hum_val, buf);
       } 
+      
+      // --- STREAK TRACKER EVALUATION ---
+      bool isHappy = (current_soil >= 30 && current_temp >= 20.0 && current_temp <= 28.0);
+      
+      if (isHappy) {
+          if (!isStreakActive) {
+              isStreakActive = true;
+              streakStartTime = millis();
+          }
+          currentStreakHours = (millis() - streakStartTime) / 3600000;
+      } else {
+          isStreakActive = false;
+          currentStreakHours = 0; 
+      }
+
+      // --- REINFORCED LEARNING NOTIFICATION CHECK ---
+      if (autoWingsEnabled && !isFlapping) {
+          bool alarmTriggered = false;
+
+          if (current_soil < SOIL_THRESHOLD) {
+              if (lastSoilAlarmTime == 0 || millis() - lastSoilAlarmTime >= ALARM_COOLDOWN) {
+                  Serial.println("⚠️ SOIL ALARM! Stuttering wings triggered.");
+                  lastSoilAlarmTime = millis();
+                  startFlapping(FLAP_WATER_ALARM);
+                  alarmTriggered = true;
+              }
+          } else {
+              lastSoilAlarmTime = 0; 
+          }
+
+          if (!alarmTriggered && current_temp > 28.0) {
+              if (lastTempAlarmTime == 0 || millis() - lastTempAlarmTime >= ALARM_COOLDOWN) {
+                  Serial.println("🔥 TEMP ALARM! Frantic sweep triggered.");
+                  lastTempAlarmTime = millis();
+                  startFlapping(FLAP_TEMP_ALARM);
+              }
+          } else if (current_temp <= 28.0) {
+              lastTempAlarmTime = 0; 
+          }
+      }
   }
 }

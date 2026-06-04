@@ -11,7 +11,7 @@
 
 // Capacitive Soil Moisture Sensor
 // Must be an ADC (Analog-to-Digital) capable pin between 1 and 20.
-#define SOIL_PIN 41 
+#define SOIL_PIN 2
 
 // ==========================================
 // SERVO PIN DEFINITIONS (LilyGO T4 S3)
@@ -25,7 +25,7 @@
 // ==========================================
 // The ESP32-S3 reads analog voltages from 0 to 4095. 
 // You will need to calibrate these exact numbers!
-#define SOIL_DRY_VAL 3200 
-#define SOIL_WET_VAL 1400 
+#define SOIL_DRY_VAL 3416 
+#define SOIL_WET_VAL 1279
 
 #endif // PINCONFIG_H
