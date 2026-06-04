@@ -20,8 +20,8 @@
 // ==========================================
 // CONFIGURATION: WIFI 
 // ==========================================
-const char* ssid = "Nooruddin";       
-const char* password = "IRONMAIDEN"; 
+const char* ssid = "Your wifi ssid here";       
+const char* password = "Your wifi password here"; 
 
 WebServer server(80); 
 String localIP = "Not Connected";
