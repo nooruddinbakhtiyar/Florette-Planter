@@ -1,4 +1,4 @@
-# Flora Planter OS 🐞
+# Florette Planter OS 🐞
 
 A smart, interactive botanical dashboard and automated watering system built for the LilyGO T-Display AMOLED (ESP32-S3). Featuring a custom Ladybug-themed UI built with LVGL, this system provides real-time environmental monitoring and automated physical responses for optimal plant care.
 
