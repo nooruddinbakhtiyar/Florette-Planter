@@ -22,8 +22,8 @@ A smart, interactive botanical dashboard and automated watering system built for
 | Component | ESP32-S3 Pin | Notes |
 | :--- | :--- | :--- |
 | **DHT22** | `GPIO 21` | Digital Input |
-| **Soil Sensor** | `GPIO 1` | 12-bit ADC Input |
-| **SG90 Servo** | `GPIO 22` | PWM Output |
+| **Soil Sensor** | `GPIO 2` | 12-bit ADC Input |
+| **SG90 Servo** | `GPIO 39` | PWM Output |
 
 *Note: The servo requires 5V power from an external source (like the Arduino Uno 5V pin). Do not power the servo directly from the LilyGO, but ensure all components share a common Ground.*
 
