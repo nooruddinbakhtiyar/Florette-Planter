@@ -29,7 +29,7 @@ A smart, interactive botanical dashboard and automated watering system built for
 
 ## 💻 Software Dependencies
 
-This project is built using **PlatformIO**. Ensure you have the following libraries installed in your `platformio.ini`:
+This project is built using **PlatformIO**. The main code written for the CBL Project 2 is within the 'ladybug' folderEnsure you have the following libraries installed in your `platformio.ini`:
 
 * `LilyGo_AMOLED`
 * `lvgl` (v8.x)
